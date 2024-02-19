@@ -1,4 +1,5 @@
 import numba
+from numba.typed import List, Dict
 import numpy as np
 
 from collections import namedtuple
@@ -266,7 +267,64 @@ def eom_recursion(node, cluster_tree, node_scores, selected_clusters):
 
 
 @numba.njit()
-def extract_eom_clusters(condensed_tree, cluster_tree, allow_single_cluster=False):
+def unselect_below_node_iterative(node, cluster_tree, selected_clusters):
+    stack = List()
+    stack.append(node)
+    
+    while len(stack) > 0:
+        current_node = stack.pop()
+        children = cluster_tree.child[cluster_tree.parent == current_node]
+        for child in children:
+            stack.append(child)
+            selected_clusters[child] = False
+
+@numba.njit(fastmath=True)
+def eom_iterative(root_node, cluster_tree, node_scores, selected_clusters):
+    stack = List()
+    stack.append(root_node)
+    
+    processed = Dict.empty(key_type=np.int64, value_type=np.bool_)
+    child_scores = Dict.empty(key_type=np.int64, value_type=np.float64)
+    
+    while len(stack) > 0:
+        node = stack[-1]  # Peek at the top of the stack without popping
+        
+        if node not in processed:
+            processed[node] = False
+            children = cluster_tree.child[cluster_tree.parent == node]
+            
+            if len(children) == 0:  # If no children, mark as processed directly
+                processed[node] = True
+                child_scores[node] = 0.0  # No children means no child score
+            else:
+                for child in children:
+                    if child not in processed:  # Add unprocessed children to stack
+                        stack.append(child)
+        else:
+            if not processed[node]:  # Process node if its children have been processed
+                stack.pop()  # Remove the node since it's being processed now
+                child_score_total = 0.0
+                for child in cluster_tree.child[cluster_tree.parent == node]:
+                    child_score_total += child_scores.get(child, 0.0)
+                child_scores[node] = child_score_total
+                
+                current_score = node_scores[node]
+                if child_score_total > current_score:
+                    child_scores[node] = child_score_total
+                else:
+                    selected_clusters[node] = True
+                    unselect_below_node_iterative(node, cluster_tree, selected_clusters)
+                    child_scores[node] = current_score
+                
+                processed[node] = True
+
+    # Return the final score for the root node
+    return child_scores.get(root_node, node_scores[root_node])
+
+
+
+@numba.njit()
+def extract_eom_clusters(condensed_tree, cluster_tree, allow_single_cluster=False, eom_iter=False):
     node_scores = score_condensed_tree_nodes(condensed_tree)
     selected_clusters = {node: False for node in node_scores}
 
@@ -275,14 +333,27 @@ def extract_eom_clusters(condensed_tree, cluster_tree, allow_single_cluster=Fals
 
     cluster_tree_root = cluster_tree.parent.min()
 
-    if allow_single_cluster:
-        eom_recursion(cluster_tree_root, cluster_tree, node_scores, selected_clusters)
-    elif len(node_scores) > 1:
-        root_children = cluster_tree.child[cluster_tree.parent == cluster_tree_root]
-        for child_node in root_children:
-            eom_recursion(child_node, cluster_tree, node_scores, selected_clusters)
+    if eom_iter:
 
-    return np.asarray([node for node, selected in selected_clusters.items() if selected])
+        if allow_single_cluster:
+            eom_iterative(cluster_tree_root, cluster_tree, node_scores, selected_clusters)
+        elif len(node_scores) > 1:
+            root_children = cluster_tree.child[cluster_tree.parent == cluster_tree_root]
+            for child_node in root_children:
+                eom_iterative(child_node, cluster_tree, node_scores, selected_clusters)
+
+        return np.asarray([node for node, selected in selected_clusters.items() if selected])
+
+    else:
+
+        if allow_single_cluster:
+            eom_recursion(cluster_tree_root, cluster_tree, node_scores, selected_clusters)
+        elif len(node_scores) > 1:
+            root_children = cluster_tree.child[cluster_tree.parent == cluster_tree_root]
+            for child_node in root_children:
+                eom_recursion(child_node, cluster_tree, node_scores, selected_clusters)
+
+        return np.asarray([node for node, selected in selected_clusters.items() if selected])
 
 
 @numba.njit()
